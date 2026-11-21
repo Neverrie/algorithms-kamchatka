@@ -243,6 +243,8 @@ def make_app(db_path=None, building_path=None, graph_path=None, solver=None, wea
     object_registry = register_object_api(api, city, city_snow, parse_inventory_bbox)
     from .dynamic_api import register_dynamic_api
     register_dynamic_api(api, city, store.path, parse_inventory_bbox, object_registry)
+    from .mobility_api import register_mobility_api
+    register_mobility_api(api, object_registry, parse_inventory_bbox)
 
     @api.get("/api/v1/city/access-roads", tags=["Access"])
     def access_roads(bbox: str = Query(PILOT_QUERY), mode: Literal["all", "vehicle", "pedestrian"] = "all"):
