@@ -12,6 +12,7 @@ ROAD_CLASSES = frozenset({
     "living_street", "primary_link", "secondary_link", "tertiary_link",
 })
 MOTOR_KEYS = ("access", "vehicle", "motor_vehicle", "motorcar", "hgv")
+VEHICLE_DIMENSIONS = ("maxweight", "maxaxleload", "maxheight", "maxwidth", "maxlength")
 OSM_ATTRIBUTION = "© OpenStreetMap contributors"
 OSM_LICENSE_URL = "https://www.openstreetmap.org/copyright"
 FACILITY_TAGS = {
@@ -70,14 +71,14 @@ def length_m(start, end) -> int:
     return ceil(12_742_017.6 * asin(sqrt(min(1, half_chord))))
 
 
-def way_filter(metadata):
+def way_filter(metadata, inspection=False):
     if metadata.get("highway") not in ROAD_CLASSES or metadata.get("area") == "yes":
         return "outside_demo_road_classes"
     if any(metadata.get(key, "yes") not in {"yes", "permissive", "designated"}
            for key in MOTOR_KEYS):
         return "access_tag"
-    keys = ("maxweight", "maxaxleload", "maxheight", "maxwidth", "maxlength", "incline", "oneway")
-    if any(key.startswith(keys[:-1]) or key.endswith(":conditional")
+    limits = VEHICLE_DIMENSIONS if inspection else (*VEHICLE_DIMENSIONS, "incline")
+    if any(key.startswith(limits) or key.endswith(":conditional")
            or (key.startswith("oneway:") and key.split(":")[1] in MOTOR_KEYS)
            for key in metadata):
         return "explicit_dimension_grade_or_special_rule"
@@ -86,14 +87,50 @@ def way_filter(metadata):
     return None
 
 
-def load_osm(path: Path) -> RoadGraph:
+def _read_snapshot(path: Path):
     raw = path.read_bytes()
     if path.suffix == ".gz":
         raw = gzip.decompress(raw)
     root = ElementTree.fromstring(raw)
     if root.tag != "osm" or root.attrib.get("version") != "0.6":
         raise ValueError("expected OSM XML v0.6")
-    digest = sha256(raw).hexdigest()
+    return raw, root
+
+
+def load_osm(path: Path) -> RoadGraph:
+    raw, root = _read_snapshot(path)
+    return _build_graph(root, sha256(raw).hexdigest(), "demo-v1")
+
+
+def load_osm_snapshots(paths) -> RoadGraph:
+    """Merge comparable OSM extracts by object ID and highest mapped version."""
+    merged = ElementTree.Element("osm", version="0.6")
+    objects = {}
+    revision = sha256()
+    bounds = set()
+    for path in paths:
+        raw, root = _read_snapshot(path)
+        boxes = root.findall("bounds")
+        if not boxes:
+            continue
+        revision.update(sha256(raw).digest())
+        for item in boxes:
+            key = tuple(sorted(item.attrib.items()))
+            if key not in bounds:
+                bounds.add(key)
+                merged.append(item)
+        for item in root:
+            if item.tag not in {"node", "way", "relation"}:
+                continue
+            key = (item.tag, int(item.attrib["id"]))
+            version = int(item.get("version", "0"))
+            if key not in objects or version > objects[key][0]:
+                objects[key] = (version, item)
+    merged.extend(item for _, item in objects.values() if item.get("visible") != "false")
+    return _build_graph(merged, revision.hexdigest(), "city-v2", inspection=True)
+
+
+def _build_graph(root, digest, version, inspection=False):
     boxes = [tuple(float(b.attrib[key]) for key in ("minlon", "minlat", "maxlon", "maxlat"))
              for b in root.findall("bounds")]
     if not boxes:
@@ -110,9 +147,10 @@ def load_osm(path: Path) -> RoadGraph:
         int(node.attrib["id"]): (float(node.attrib["lon"]), float(node.attrib["lat"]))
         for node in root.findall("node")
     }
+    node_limits = VEHICLE_DIMENSIONS if inspection else ("max", "incline")
     blocked_nodes = {
         int(node.attrib["id"]) for node in root.findall("node")
-        if any(key == "barrier" or key in MOTOR_KEYS or key.startswith(("max", "incline"))
+        if any(key == "barrier" or key in MOTOR_KEYS or key.startswith(node_limits)
                for key in tags(node))
     }
     resolved, unsupported, excluded_ways = [], [], set()
@@ -142,7 +180,7 @@ def load_osm(path: Path) -> RoadGraph:
     for way in sorted(root.findall("way"), key=lambda item: int(item.attrib["id"])):
         way_id = int(way.attrib["id"])
         metadata = tags(way)
-        reason = way_filter(metadata)
+        reason = way_filter(metadata, inspection)
         if way_id in excluded_ways:
             reason = "unsupported_turn_relation"
         if reason:
@@ -153,7 +191,7 @@ def load_osm(path: Path) -> RoadGraph:
         if direction is None and metadata.get("junction") in {"roundabout", "circular"}:
             direction = "yes"
         for a, b in zip(refs, refs[1:]):
-            if a == b or a in blocked_nodes or b in blocked_nodes:
+            if a == b or a in blocked_nodes or b in blocked_nodes or a not in nodes or b not in nodes:
                 continue
             if not covered((nodes[a], nodes[b])):
                 continue
@@ -223,7 +261,7 @@ def load_osm(path: Path) -> RoadGraph:
                 facilities.append(Facility(f"osm:{item.tag}:{node_id}", kind,
                                            metadata.get("name", ""), point))
     graph_nodes = {node: nodes[node] for node in sorted(set(incoming) | set(outgoing))}
-    return RoadGraph(f"osm-{digest[:16]}-demo-v1", graph_nodes, edges, frozenset(forbidden), {
+    return RoadGraph(f"osm-{digest[:16]}-{version}", graph_nodes, edges, frozenset(forbidden), {
         "raw_sha256": digest, "bbox": [west, south, east, north], "nodes": len(graph_nodes),
         "edges": len(edges), "via_node_relations": len(resolved),
         "unsupported_relation_ids": sorted(unsupported), "excluded_ways": dict(excluded),
